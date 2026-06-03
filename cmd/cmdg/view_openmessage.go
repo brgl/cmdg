@@ -1,16 +1,10 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"flag"
 	"fmt"
-	"os"
-	"os/exec"
-	"regexp"
 	"strings"
-	"time"
-	"unicode"
 
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
@@ -21,522 +15,317 @@ import (
 	"github.com/ThomasHabets/cmdg/pkg/input"
 )
 
-const (
-	tsLayout = "2006-01-02 15:04:05"
+var (
+	showMessageID = flag.Bool("show_message_id", false, "Show message ID in a message.")
+)
 
-	openMessageViewHelp = `?, F1     — Help
-^R             — Reload
-l              — Add label
-L              — Remove label
-*              — Toggle "starred"
-u, ←           — Exit message
-U              — Mark unread
-n, Down        — Scroll down
-space          — Page down
-backspace      — Page up
-p, Up          — Scroll up
-^P             — Previous message
-^N             — Next message
-f              — Forward message
-r              — Reply
-s, ^s          — Search within message
-a              — Reply all
-d              — Delete
-e              — Archive
-t, →           — Browse attachments (if any)
-H              — Force HTML view
-\              — Show raw message source
-|              — Pipe to command
+const (
+	conversationViewHelp = `?, F1              — Help
+u, ←               — Back to thread list
+^N                 — Next thread
+^P                 — Previous thread
+enter              — Expand/collapse message
+n, j, Down         — Scroll down / next message header
+p, k, Up           — Scroll up / previous message header
+Space, PgDn        — Page down
+Backspace, PgUp    — Page up
+e                  — Archive thread
+d                  — Trash thread
+l                  — Add label to thread
+L                  — Remove label from thread
+*                  — Toggle starred
+r                  — Reply to last message
+a                  — Reply all to last message
+f                  — Forward last message
+t                  — View attachments of focused message
+q                  — Quit
 
 Press [enter] to exit
 `
 )
 
-var (
-	enableDottime = flag.Bool("dottime", false, "Enable dottime.")
-	showMessageID = flag.Bool("show_message_id", false, "Show message ID in a message.")
-)
-
-func isGraphicString(s string) bool {
-	for _, r := range s {
-		if !unicode.IsGraphic(r) {
-			return false
-		}
-	}
-	return true
-}
-
-func hilightIncremental(s string, m [][]int, format string) string {
-	pos := 0
-	var ret []string
-	for _, h := range m {
-		a, b := h[0], h[1]
-		if a > pos {
-			ret = append(ret, s[pos:a])
-		}
-		ret = append(ret, fmt.Sprintf("%s%s%s", format, s[a:b], display.Reset))
-		pos = b
-	}
-	if pos < len(s) {
-		ret = append(ret, s[pos:])
-	}
-	return strings.Join(ret, "")
-}
-
-func help(txt string, keys *input.Input) error {
-	screen, err := display.NewScreen()
-	if err != nil {
-		return err
-	}
-	lines := strings.Split(txt, "\n")
-	maxlen := 0
-	for _, l := range lines {
-		if n := len(l); n > maxlen {
-			maxlen = n
-		}
-	}
-	screen.Printlnf(0, "%s", strings.Repeat("—", screen.Width))
-	for n, l := range lines {
-		screen.Printlnf(n+1, "%s%s", strings.Repeat(" ", (screen.Width-maxlen)/2), l)
-	}
-	for {
-		screen.Draw()
-		k := <-keys.Chan()
-		switch k {
-		case input.Enter:
-			return nil
-		}
-	}
-}
-
-// OpenMessageView is the view for an open message.
-type OpenMessageView struct {
-	msg    *cmdg.Message
+// ConversationView displays all messages in a thread stacked vertically.
+type ConversationView struct {
+	thread *cmdg.Thread
 	keys   *input.Input
 	screen *display.Screen
 
 	update chan struct{}
 	errors chan error
 
-	inIncrementalSearch bool
-	incrementalCount    int
-	incrementalCurrent  int
-	incrementalQuery    string
-
-	// Local view state. Main goroutine only.
-	preferHTML bool
+	// View state
+	scroll       int
+	expandedMsgs map[int]bool // which message indices are expanded
+	focusedMsg   int          // index of the focused message header
 }
 
-func dottime(t time.Time) string {
-	_, s := t.Zone()
-	return t.UTC().Format("2006-01-02T15·04·05") + fmt.Sprintf("%+03d", s/3600)
-}
-
-// NewOpenMessageView creates a new open message view.
-func NewOpenMessageView(ctx context.Context, msg *cmdg.Message, in *input.Input) (*OpenMessageView, error) {
-	screen, err := display.NewScreen()
-	if err != nil {
-		return nil, err
-	}
-	ov := &OpenMessageView{
-		msg:    msg,
-		keys:   in,
-		screen: screen,
-		update: make(chan struct{}),
-		errors: make(chan error, 20),
+// NewConversationView creates a new conversation view.
+func NewConversationView(ctx context.Context, thread *cmdg.Thread, in *input.Input) *ConversationView {
+	cv := &ConversationView{
+		thread:       thread,
+		keys:         in,
+		update:       make(chan struct{}, 1),
+		errors:       make(chan error, 20),
+		expandedMsgs: make(map[int]bool),
 	}
 	go func() {
-		st := time.Now()
-		if err := msg.Preload(ctx, cmdg.LevelFull); err != nil {
-			ov.errors <- err
-		}
-		log.Infof("Got full message in %v", time.Since(st))
-		ov.update <- struct{}{}
-	}()
-	return ov, err
-}
-
-func cancelledContext() context.Context {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	return ctx
-}
-
-// Draw draws the open message.
-func (ov *OpenMessageView) Draw(lines []string, scroll int) error {
-	// Some functions below need a context, but they should never make RPCs so let's give them
-	ctx := cancelledContext()
-
-	line := 0
-	contentSpace := ov.screen.Height - 10
-
-	var searching string
-	if ov.inIncrementalSearch {
-		searching = fmt.Sprintf(" Incremental search: %s (at %d of %d)", ov.incrementalQuery, ov.incrementalCurrent, ov.incrementalCount)
-	}
-
-	// TODO: msg index.
-	ov.screen.Printlnf(
-		line,
-		"Scroll %d-%d/%d (%d%%)%s",
-		scroll,
-		min(scroll+contentSpace, len(lines)),
-		len(lines),
-		min(100, int(100*float64(scroll+contentSpace)/float64(len(lines)))),
-		searching,
-	)
-	line++
-
-	// From.
-	from, err := ov.msg.GetHeader(ctx, "From")
-	if err != nil {
-		ov.errors <- err
-		from = fmt.Sprintf("Unknown: %q", err)
-	}
-	var signed string
-	var encrypted string
-	if st := ov.msg.GPGStatus(); st != nil {
-		if st.Signed != "" {
-			if st.GoodSignature {
-				signed = fmt.Sprintf(" — signed by %s", st.Signed)
-				if len(st.Warnings) == 0 {
-					signed = display.Bold + display.Green + signed
-				} else {
-					signed = " but with warnings"
-				}
-			} else {
-				signed = fmt.Sprintf("%s — BAD signature from %s", display.Bold+display.Red, st.Signed)
-			}
-		}
-		if len(st.Encrypted) != 0 {
-			encrypted = fmt.Sprintf("%s — Encrypted to %s", display.Green+display.Bold, strings.Join(st.Encrypted, ";"))
-		}
-	}
-	ov.screen.Printlnf(line, "From: %s%s", from, signed)
-	line++
-
-	// To.
-	to, err := ov.msg.GetHeader(ctx, "To")
-	if err != nil {
-		ov.errors <- err
-		to = fmt.Sprintf("Unknown: %q", err)
-	}
-	ov.screen.Printlnf(line, "To: %s%s", to, encrypted)
-	line++
-
-	// CC.
-	cc, err := ov.msg.GetHeader(ctx, "CC")
-	if err != nil {
-		cc = ""
-	}
-	ov.screen.Printlnf(line, "CC: %s", cc)
-	line++
-
-	// Date.
-
-	if date, err := ov.msg.GetOriginalTime(ctx); err != nil {
-		log.Warningf("Could not parse date for message: %v", err)
-		s, _ := ov.msg.GetDateHeader(ctx)
-		ov.screen.Printlnf(line, "Date: %s (parse error: %v)", s, err)
-		//ov.errors <- err
-	} else {
-		dateLocal := date.Local()
-		dt := ""
-		if *enableDottime {
-			dt = fmt.Sprintf(" (dottime: %s)", dottime(date))
-		}
-		ov.screen.Printlnf(line, "Date: %s%s", dateLocal.Format(tsLayout), dt)
-	}
-	line++
-
-	// Subject
-	subject, err := ov.msg.GetSubject(ctx)
-	if err != nil {
-		ov.errors <- err
-		subject = fmt.Sprintf("Unknown: %q", err)
-	}
-	ov.screen.Printlnf(line, "Subject: %s", subject)
-	line++
-
-	// Labels
-	labels, err := ov.msg.GetLabelsString(ctx)
-	if err != nil {
-		ov.errors <- err
-		labels = fmt.Sprintf("Unknown: %q", err)
-	}
-	ov.screen.Printlnf(line, "Labels: %s", labels)
-	line++
-
-	// Message ID
-	if *showMessageID {
-		if msgid, err := ov.msg.GetHeader(ctx, "Message-ID"); err == nil {
-			ov.screen.Printlnf(line, "Message-ID: %s", msgid)
-			line++
-		} else {
-			ov.errors <- err
-		}
-	}
-
-	ov.screen.Printlnf(line, "%s", strings.Repeat("—", ov.screen.Width))
-	line++
-
-	// Draw body.
-	if len(lines) > scroll {
-		for _, l := range lines[scroll:] {
-			l = strings.TrimRight(l, "\r ")
-			ov.screen.Printlnf(line, "%s", l)
-			line++
-			if line >= ov.screen.Height-2 {
-				break
-			}
-		}
-	} else {
-		log.Errorf("Scroll too high! %d >= %d", scroll, len(lines))
-	}
-	ov.screen.Printlnf(ov.screen.Height-2, "%s", strings.Repeat("—", ov.screen.Width))
-	return nil
-}
-
-func showError(oscreen *display.Screen, keys *input.Input, msg string) {
-	log.Warningf("Displaying error to user: %q", msg)
-
-	screen := oscreen.Copy()
-	lines := []string{
-		strings.Repeat("—", screen.Width),
-	}
-	for len(msg) > 0 {
-		this := msg
-		if len(this) > screen.Width {
-			this, msg = msg[:screen.Width], msg[screen.Width:]
-		} else {
-			msg = ""
-		}
-		lines = append(lines, this)
-	}
-	lines = append(lines, "Press [enter] to continue", lines[0])
-	start := (screen.Height - len(lines)) / 2
-	for n, l := range lines {
-		screen.Printlnf(start+n, "%s%s", display.Red, l)
-	}
-	screen.Draw()
-	for {
-		if input.Enter == <-keys.Chan() {
+		if err := thread.Preload(ctx, cmdg.LevelFull); err != nil {
+			cv.errors <- err
 			return
 		}
-	}
+		// Mark thread as read
+		if err := thread.RemoveLabelID(ctx, cmdg.Unread); err != nil {
+			log.Warningf("Failed to mark thread as read: %v", err)
+		}
+		// Expand the last message by default
+		count := thread.MessageCount()
+		if count > 0 {
+			cv.expandedMsgs[count-1] = true
+			cv.focusedMsg = count - 1
+		}
+		cv.update <- struct{}{}
+	}()
+	return cv
 }
 
-func (ov *OpenMessageView) incrementalSearch(ctx context.Context, inlines []string) (int, error) {
-	lines := make([]string, len(inlines))
-	copy(lines, inlines)
-
-	ov.inIncrementalSearch = true
-	defer func() { ov.inIncrementalSearch = false }()
-	ov.incrementalQuery = ""
-
-	if err := ov.Draw(lines, 0); err != nil {
-		log.Infof("Failed to draw: %v", err)
+// wrapAddressHeader wraps a header line (like "    To: addr1, addr2, ...") at
+// the given width, breaking at comma boundaries and indenting continuation
+// lines to align with the first address.
+func wrapAddressHeader(prefix, value string, width int) []string {
+	if width <= 0 || len(prefix+value) <= width {
+		return []string{prefix + value}
 	}
-	ov.screen.Draw()
 
-	found := 0
-	start := 0
-	for {
-		var ok bool
-		var key string
-		select {
-		case <-ctx.Done():
-			return -1, ctx.Err()
-		case key, ok = <-ov.keys.Chan():
-		}
-		if !ok {
-			return -1, fmt.Errorf("incremental search key read channel closed")
-		}
-		switch key {
-		case input.CtrlC:
-			return found, nil
-		case input.CtrlU:
-			ov.incrementalQuery = ""
-		case input.CtrlS, input.CtrlN, input.Enter, input.Return:
-			start = found + 1
-		case input.CtrlH, input.Backspace:
-			ov.incrementalQuery = dialog.TrimOneChar(ov.incrementalQuery)
-		default:
-			if isGraphicString(key) {
-				ov.incrementalQuery += key
-			}
-		}
-		const queryPrefix = "(?i)"
-		re, err := regexp.Compile(queryPrefix + ov.incrementalQuery)
-		if err != nil {
-			var err2 error
-			re, err2 = regexp.Compile(queryPrefix + regexp.QuoteMeta(ov.incrementalQuery))
-			if err2 != nil {
-				return -1, fmt.Errorf("can't happen: couldn't regexp compile %q or quotemeta'd %q: %v; %v", ov.incrementalQuery, regexp.QuoteMeta(ov.incrementalQuery), err, err2)
-			}
+	indent := strings.Repeat(" ", len(prefix))
+	var lines []string
+	remaining := value
+	currentLine := prefix
+
+	for remaining != "" {
+		idx := strings.Index(remaining, ",")
+		var segment string
+		if idx == -1 {
+			segment = remaining
+			remaining = ""
+		} else {
+			segment = remaining[:idx+1] + " "
+			remaining = strings.TrimLeft(remaining[idx+1:], " ")
 		}
 
-		found = -1
-		for found == -1 {
-			ov.incrementalCount = 0
-			ov.incrementalCurrent = 0
-			// Find from here
-			for n, l := range lines {
-				if m := re.FindAllStringSubmatchIndex(l, -1); len(m) > 0 {
-					ov.incrementalCount++
-					if n >= start && found == -1 {
-						// Current hit.
-						ov.incrementalCurrent = ov.incrementalCount
-						found = n
-						lines[n] = hilightIncremental(lines[n], m, display.Reverse+display.Yellow)
-					} else {
-						// Other hits that may be visible.
-						lines[n] = hilightIncremental(lines[n], m, display.Reverse)
-					}
+		if len(currentLine)+len(segment) > width && currentLine != prefix && currentLine != indent {
+			lines = append(lines, strings.TrimRight(currentLine, " "))
+			currentLine = indent + segment
+		} else {
+			currentLine += segment
+		}
+	}
+	if strings.TrimSpace(currentLine) != "" {
+		lines = append(lines, strings.TrimRight(currentLine, " "))
+	}
+	return lines
+}
+
+// renderLines renders the conversation into a slice of display lines.
+func (cv *ConversationView) renderLines(ctx context.Context) []string {
+	var lines []string
+
+	// Thread subject header
+	subj, err := cv.thread.Subject(ctx)
+	if err != nil || subj == "" {
+		subj = "(No subject)"
+	}
+	lines = append(lines, fmt.Sprintf("%s%s%s", display.Bold, subj, display.Reset))
+	lines = append(lines, strings.Repeat("─", 60))
+
+	count := cv.thread.MessageCount()
+	for i := 0; i < count; i++ {
+		msgs := cv.thread.Messages
+		if i >= len(msgs) {
+			break
+		}
+		msg := msgs[i]
+
+		// Message header line
+		from, _ := msg.GetFrom(ctx)
+		if from == "" {
+			from = "?"
+		}
+		date := ""
+		if t, err := msg.GetOriginalTime(ctx); err == nil {
+			date = t.Format("Jan 02, 2006 15:04")
+		}
+
+		headerPrefix := "▶"
+		if cv.expandedMsgs[i] {
+			headerPrefix = "▼"
+		}
+		focusMarker := "  "
+		if i == cv.focusedMsg {
+			focusMarker = display.Reverse + "→" + display.Reset + " "
+		}
+
+		headerLine := fmt.Sprintf("%s%s %s%s%s  %s",
+			focusMarker, headerPrefix, display.Bold, from, display.Reset, date)
+		lines = append(lines, headerLine)
+
+		if cv.expandedMsgs[i] {
+			// Show headers
+			if *showMessageID {
+				msgID, _ := msg.GetHeader(ctx, "Message-ID")
+				if msgID != "" {
+					lines = append(lines, fmt.Sprintf("    Message-ID: %s", msgID))
 				}
 			}
-			// Found.
-			if found > 0 {
-				break
+			screenWidth := 0
+			if cv.screen != nil {
+				screenWidth = cv.screen.Width
 			}
-
-			// Not found; wrap.
-			if start != 0 {
-				start = 0
-				continue
+			to, _ := msg.GetHeader(ctx, "To")
+			if to != "" {
+				lines = append(lines, wrapAddressHeader("    To: ", to, screenWidth)...)
 			}
+			cc, _ := msg.GetHeader(ctx, "CC")
+			if cc != "" {
+				lines = append(lines, wrapAddressHeader("    CC: ", cc, screenWidth)...)
+			}
+			lines = append(lines, "")
 
-			// Not found even after wrapping.
-			found = 0
+			// Message body
+			body, err := msg.GetBody(ctx)
+			if err != nil {
+				lines = append(lines, fmt.Sprintf("    [Error loading body: %v]", err))
+			} else {
+				for _, bl := range strings.Split(body, "\n") {
+					lines = append(lines, "    "+bl)
+				}
+			}
+			lines = append(lines, "")
 		}
-		if err := ov.Draw(lines, found); err != nil {
-			log.Infof("Failed to draw: %v", err)
-		}
-		copy(lines, inlines)
-		ov.screen.Draw()
+		lines = append(lines, strings.Repeat("─", 60))
 	}
+	return lines
 }
 
-// Run runs the open message view event loop.
-func (ov *OpenMessageView) Run(ctx context.Context) (*MessageViewOp, error) {
-	log.Infof("Running OpenMessageView")
-	scroll := 0
-	initScreen := func() error {
-		var err error
-		ov.screen, err = display.NewScreen()
-		if err != nil {
-			return err
-		}
-		scroll = 0
-		return nil
-	}
-	if err := initScreen(); err != nil {
+// Run runs the conversation view and returns a ThreadViewOp.
+func (cv *ConversationView) Run(ctx context.Context) (*ThreadViewOp, error) {
+	var err error
+	cv.screen, err = display.NewScreen()
+	if err != nil {
 		return nil, err
 	}
-	ov.screen.Printf(0, 0, "Loading…")
-	ov.screen.Draw()
-	var lines []string
-	for {
-		select {
-		case <-ov.keys.Winch():
-			log.Infof("OpenMessageView got WINCH")
-			s := scroll
-			if err := initScreen(); err != nil {
-				// Screen failed to init. Yeah it's time to bail.
-				return nil, err
-			}
-			scroll = s
-			go func() {
-				ov.update <- struct{}{}
-			}()
-		case err := <-ov.errors:
-			if err != nil {
-				showError(ov.screen, ov.keys, err.Error())
-				ov.screen.Draw()
-			}
-			continue
-		case <-ov.update:
-			log.Infof("Message arrived")
-			gb := ov.msg.GetBody
-			if ov.preferHTML {
-				gb = ov.msg.GetBodyHTML
-			}
-			b, err := gb(ctx)
-			if err != nil {
-				ov.errors <- errors.Wrapf(err, "Getting message body")
-			} else {
-				lines = []string{}
-				for _, l := range strings.Split(b, "\n") {
-					if len(l) == 0 {
-						lines = append(lines, "")
-						continue
-					}
-					for len(l) > 0 {
-						// TODO: break on runewidth
-						// TODO: break on word boundary
-						if len(l) > ov.screen.Width {
-							lines = append(lines, l[:ov.screen.Width])
-							l = l[ov.screen.Width:]
-						} else {
-							lines = append(lines, l)
-							l = ""
-						}
-					}
-				}
-			}
-			go func() {
-				if ov.msg.IsUnread() {
-					st := time.Now()
-					if err := ov.msg.RemoveLabelID(ctx, cmdg.Unread); err != nil {
-						ov.errors <- errors.Wrapf(err, "Failed to remove unread label")
-					} else {
-						log.Infof("Marked unread in %v", time.Since(st))
-					}
-				}
-				// Does not need to be signaled to
-				// messageview; label list gets
-				// updated by RemoveLabelID.
-			}()
-			// Redraw could include fewer lines, because 'H' toggled HTML.
-			ov.screen.Clear()
+	defer func() {
+		cv.screen.Clear()
+		cv.screen.Draw()
+	}()
 
-			// TODO: double check that scroll is not too high after `lines` was recreated.
-			if err := ov.Draw(lines, scroll); err != nil {
-				log.Infof("Failed to draw: %v", err)
-			}
-		case key, ok := <-ov.keys.Chan():
-			if !ok {
-				log.Errorf("OpenMessage: Input channel closed!")
+	cv.screen.Printf(0, 0, "Loading conversation…")
+	cv.screen.Draw()
+
+	contentHeight := cv.screen.Height - 2
+
+	draw := func() {
+		lines := cv.renderLines(ctx)
+		for n := 0; n < contentHeight; n++ {
+			cur := n + cv.scroll
+			if cur >= len(lines) {
+				cv.screen.Printlnf(n, "")
 				continue
 			}
+			cv.screen.Printlnf(n, "%s", lines[cur])
+		}
+		totalLines := len(lines)
+		pct := 0
+		if totalLines > 0 {
+			pct = min(100, int(100*float64(cv.scroll+contentHeight)/float64(totalLines)))
+		}
+		cv.screen.Printlnf(cv.screen.Height-2, "%s", strings.Repeat("—", cv.screen.Width))
+		cv.screen.Printlnf(cv.screen.Height-1, "Conversation: %d messages | %d%% | [?] help",
+			cv.thread.MessageCount(), pct)
+		cv.screen.Draw()
+	}
 
+	for {
+		select {
+		case <-cv.update:
+			draw()
+			continue
+		case err := <-cv.errors:
+			showError(cv.screen, cv.keys, err.Error())
+			cv.screen.Draw()
+			continue
+		case <-cv.keys.Winch():
+			cv.screen, err = display.NewScreen()
+			if err != nil {
+				return nil, err
+			}
+			contentHeight = cv.screen.Height - 2
+		case key, ok := <-cv.keys.Chan():
+			if !ok {
+				continue
+			}
 			switch key {
-			case input.CtrlR:
-				go func() {
-					if err := ov.msg.Reload(ctx, cmdg.LevelFull); err != nil {
-						ov.errors <- errors.Wrap(err, "reloading message")
-					}
-					ov.update <- struct{}{}
-				}()
 			case "?", input.F1:
-				if err := help(openMessageViewHelp, ov.keys); err != nil {
+				if err := help(conversationViewHelp, cv.keys); err != nil {
 					log.Infof("help() failed: %v", err)
 				}
-			case "*":
-				if ov.msg.HasLabel(cmdg.Starred) {
-					if err := ov.msg.RemoveLabelID(ctx, cmdg.Starred); err != nil {
-						ov.errors <- errors.Wrap(err, "Removing STARRED label")
-					}
+			case "u", input.Left:
+				return nil, nil
+			case input.CtrlN:
+				return ThreadOpNext(), nil
+			case input.CtrlP:
+				return ThreadOpPrev(), nil
+			case "q":
+				return ThreadOpQuit(), nil
+			case input.Enter:
+				// Toggle expand/collapse of focused message
+				cv.expandedMsgs[cv.focusedMsg] = !cv.expandedMsgs[cv.focusedMsg]
+			case "N", "n", "j", input.Down:
+				count := cv.thread.MessageCount()
+				if cv.focusedMsg < count-1 {
+					cv.focusedMsg++
 				} else {
-					if err := ov.msg.AddLabelID(ctx, cmdg.Starred); err != nil {
-						ov.errors <- errors.Wrap(err, "Adding STARRED label")
+					cv.scroll++
+				}
+			case "P", "p", "k", input.Up:
+				if cv.focusedMsg > 0 {
+					cv.focusedMsg--
+				} else if cv.scroll > 0 {
+					cv.scroll--
+				}
+			case " ", input.PgDown:
+				cv.scroll += contentHeight
+			case input.Backspace, input.PgUp:
+				cv.scroll -= contentHeight
+				if cv.scroll < 0 {
+					cv.scroll = 0
+				}
+			case "e":
+				go func() {
+					if err := cv.thread.RemoveLabelID(ctx, cmdg.Inbox); err != nil {
+						cv.errors <- errors.Wrapf(err, "archiving thread")
 					}
-				}
-				if err := ov.msg.ReloadLabels(ctx); err != nil {
-					ov.errors <- errors.Wrapf(err, "Failed to reload labels")
-				}
-				if err := ov.Draw(lines, scroll); err != nil {
-					log.Infof("Failed to draw: %v", err)
+				}()
+				return ThreadOpRemoveCurrent(nil), nil
+			case "d":
+				go func() {
+					if err := cv.thread.Trash(ctx); err != nil {
+						cv.errors <- errors.Wrapf(err, "trashing thread")
+					}
+				}()
+				return ThreadOpRemoveCurrent(nil), nil
+			case "*":
+				if cv.thread.IsStarred() {
+					go func() {
+						if err := cv.thread.RemoveLabelID(ctx, cmdg.Starred); err != nil {
+							cv.errors <- errors.Wrapf(err, "removing STARRED")
+						}
+					}()
+				} else {
+					go func() {
+						if err := cv.thread.AddLabelID(ctx, cmdg.Starred); err != nil {
+							cv.errors <- errors.Wrapf(err, "adding STARRED")
+						}
+					}()
 				}
 			case "l":
 				var opts []*dialog.Option
@@ -546,232 +335,77 @@ func (ov *OpenMessageView) Run(ctx context.Context) (*MessageViewOp, error) {
 						Label: l.Label,
 					})
 				}
-				label, err := dialog.Selection(opts, "Label> ", false, ov.keys)
+				label, err := dialog.Selection(opts, "Label> ", false, cv.keys)
 				if errors.Cause(err) == dialog.ErrAborted {
 					// No-op.
 				} else if err != nil {
-					ov.errors <- errors.Wrapf(err, "Selecting label")
+					cv.errors <- errors.Wrapf(err, "Selecting label")
 				} else {
-					st := time.Now()
-					if err := ov.msg.AddLabelID(ctx, label.Key); err != nil {
-						ov.errors <- errors.Wrapf(err, "Failed to label")
-					} else {
-						log.Infof("Labelled: %v", time.Since(st))
-					}
-					if err := ov.msg.ReloadLabels(ctx); err != nil {
-						ov.errors <- errors.Wrapf(err, "Failed to reload labels")
-					}
-				}
-				if err := ov.Draw(lines, scroll); err != nil {
-					log.Infof("Failed to draw: %v", err)
+					go func() {
+						if err := cv.thread.AddLabelID(ctx, label.Key); err != nil {
+							cv.errors <- errors.Wrapf(err, "labelling thread")
+						}
+					}()
 				}
 			case "L":
 				var opts []*dialog.Option
-				labels, err := ov.msg.GetLabels(ctx, true)
-				if err != nil {
-					ov.errors <- errors.Wrapf(err, "Getting message labels")
+				for _, l := range conn.Labels() {
+					opts = append(opts, &dialog.Option{
+						Key:   l.ID,
+						Label: l.Label,
+					})
+				}
+				label, err := dialog.Selection(opts, "Label> ", false, cv.keys)
+				if errors.Cause(err) == dialog.ErrAborted {
+					// No-op.
+				} else if err != nil {
+					cv.errors <- errors.Wrapf(err, "Selecting label")
 				} else {
-					for _, l := range labels {
-						opts = append(opts, &dialog.Option{
-							Key:   l.ID,
-							Label: l.Label,
-						})
-					}
-					label, err := dialog.Selection(opts, "Label> ", false, ov.keys)
-					if errors.Cause(err) == dialog.ErrAborted {
-						// No-op.
-					} else if err != nil {
-						ov.errors <- errors.Wrapf(err, "Selecting label")
-					} else {
-						st := time.Now()
-						if err := ov.msg.RemoveLabelID(ctx, label.Key); err != nil {
-							ov.errors <- errors.Wrapf(err, "Failed to unlabel")
-						} else {
-							log.Infof("Unlabelled: %v", time.Since(st))
+					go func() {
+						if err := cv.thread.RemoveLabelID(ctx, label.Key); err != nil {
+							cv.errors <- errors.Wrapf(err, "unlabelling thread")
 						}
-						if err := ov.msg.ReloadLabels(ctx); err != nil {
-							ov.errors <- errors.Wrapf(err, "Failed to reload labels")
-						}
-					}
-					if err := ov.Draw(lines, scroll); err != nil {
-						log.Infof("Failed to draw: %v", err)
-					}
-				}
-			case "u", input.Left:
-				return nil, nil
-			case "q":
-				return OpQuit(), nil
-			case input.CtrlP:
-				return OpPrev(), nil
-			case input.CtrlN:
-				return OpNext(), nil
-			case "U":
-				if err := ov.msg.AddLabelID(ctx, cmdg.Unread); err != nil {
-					//lint:ignore ST1005 UI-facing message intentionally starts with capital
-					ov.errors <- fmt.Errorf("Failed to mark unread : %v", err)
-				} else {
-					return nil, nil
-				}
-			case input.Home, input.XHome:
-				scroll = 0
-				if err := ov.Draw(lines, scroll); err != nil {
-					log.Infof("Failed to draw: %v", err)
-				}
-			case "n", input.Down:
-				ov.screen.UseCache()
-				scroll = ov.scroll(ctx, len(lines), scroll, 1)
-				if err := ov.Draw(lines, scroll); err != nil {
-					log.Infof("Failed to draw: %v", err)
-				}
-			case " ", input.CtrlV, input.PgDown:
-				scroll = ov.scroll(ctx, len(lines), scroll, ov.screen.Height-10)
-				if err := ov.Draw(lines, scroll); err != nil {
-					log.Infof("Failed to draw: %v", err)
-				}
-			case "p", input.Up:
-				ov.screen.UseCache()
-				scroll = ov.scroll(ctx, len(lines), scroll, -1)
-				if err := ov.Draw(lines, scroll); err != nil {
-					log.Infof("Failed to draw: %v", err)
-				}
-			case "f":
-				if err := forward(ctx, conn, ov.keys, ov.msg); err != nil {
-					//lint:ignore ST1005 UI-facing message intentionally starts with capital
-					ov.errors <- fmt.Errorf("Failed to forward: %v", err)
+					}()
 				}
 			case "r":
-				if err := reply(ctx, conn, ov.keys, ov.msg); err != nil {
-					//lint:ignore ST1005 UI-facing message intentionally starts with capital
-					ov.errors <- fmt.Errorf("Failed to reply: %v", err)
+				msgs := cv.thread.Messages
+				if cv.focusedMsg < len(msgs) {
+					if err := reply(ctx, conn, cv.keys, msgs[cv.focusedMsg]); err != nil {
+						cv.errors <- errors.Wrapf(err, "replying")
+					}
 				}
 			case "a":
-				if err := replyAll(ctx, conn, ov.keys, ov.msg); err != nil {
-					//lint:ignore ST1005 UI-facing message intentionally starts with capital
-					ov.errors <- fmt.Errorf("Failed to replyAll: %v", err)
-				}
-			case "H":
-				ov.preferHTML = !ov.preferHTML
-				scroll = 0
-				go func() {
-					ov.update <- struct{}{}
-				}()
-			case "e": // Archive
-				if err := ov.msg.RemoveLabelID(ctx, cmdg.Inbox); err != nil {
-					ov.errors <- fmt.Errorf("Failed to archive : %v", err)
-				} else {
-					return OpRemoveCurrent(nil), nil
-				}
-			case "d": // Delete
-				if err := ov.msg.RemoveLabelID(ctx, cmdg.Inbox); err != nil {
-					ov.errors <- fmt.Errorf("Failed to delete (remove Inbox label) : %v", err)
-					if err := ov.msg.AddLabelID(ctx, cmdg.Trash); err != nil {
-						ov.errors <- fmt.Errorf("Failed to delete (add Trash label) : %v", err)
-					}
-				} else {
-					return OpRemoveCurrent(nil), nil
-				}
-			case "s", input.CtrlS: // Search
-				ns, err := ov.incrementalSearch(ctx, lines)
-				if err != nil {
-					return nil, err
-				}
-				if ns > 0 {
-					scroll = ns
-				}
-				if err := ov.Draw(lines, scroll); err != nil {
-					log.Infof("Failed to draw: %v", err)
-				}
-			case "t", input.Right: // Attachmments
-				as, err := ov.msg.Attachments(ctx)
-				if err != nil {
-					ov.errors <- fmt.Errorf("Listing attachments failed: %v", err)
-				} else if len(as) > 0 {
-					if err := listAttachments(ctx, ov.keys, ov.msg); errors.Cause(err) == dialog.ErrAborted {
-						log.Infof("View attachment aborted")
-					} else if err != nil {
-						ov.errors <- fmt.Errorf("Attachment browser action failed: %v", err)
+				msgs := cv.thread.Messages
+				if cv.focusedMsg < len(msgs) {
+					if err := replyAll(ctx, conn, cv.keys, msgs[cv.focusedMsg]); err != nil {
+						cv.errors <- errors.Wrapf(err, "replying all")
 					}
 				}
-			case "\\":
-				if err := ov.showRaw(ctx); err != nil {
-					ov.errors <- err
+			case "f":
+				msgs := cv.thread.Messages
+				if cv.focusedMsg < len(msgs) {
+					if err := forward(ctx, conn, cv.keys, msgs[cv.focusedMsg]); err != nil {
+						cv.errors <- errors.Wrapf(err, "forwarding")
+					}
 				}
-			case "|":
-				cmds, err := dialog.Entry("Command> ", ov.keys)
-				if err == dialog.ErrAborted || cmds == "" {
-					// User aborted; do nothing.
-					break
-				} else if err != nil {
-					ov.errors <- errors.Wrap(err, "failed to get pipe command")
-					break
-				}
-				cmd := exec.CommandContext(ctx, *shell, "-c", cmds)
-				m, err := ov.msg.Raw(ctx)
-				if err != nil {
-					ov.errors <- errors.Wrap(err, "failed to get raw message")
-					break
-				}
-				cmd.Stdin = strings.NewReader(m)
-				var buf bytes.Buffer
-				cmd.Stdout = &buf
-				cmd.Stderr = &buf
-				if err := cmd.Run(); err != nil {
-					ov.errors <- errors.Wrapf(err, "failed run pipe command: %q", buf.String())
-					break
-				}
-				ov.errors <- ov.showPager(ctx, buf.String())
-			case input.Backspace, input.CtrlH, input.PgUp, "Meta-v":
-				scroll = ov.scroll(ctx, len(lines), scroll, -(ov.screen.Height - 10))
-				if err := ov.Draw(lines, scroll); err != nil {
-					log.Infof("Failed to draw: %v", err)
+			case "t":
+				// View attachments of focused message
+				msgs := cv.thread.Messages
+				if cv.focusedMsg < len(msgs) {
+					msg := msgs[cv.focusedMsg]
+					attachments, err := msg.Attachments(ctx)
+					if err != nil {
+						cv.errors <- errors.Wrapf(err, "getting attachments")
+					} else if len(attachments) > 0 {
+						if err := listAttachments(ctx, cv.keys, msg); err != nil {
+							cv.errors <- errors.Wrapf(err, "browsing attachments")
+						}
+					}
 				}
 			default:
-				log.Infof("Unknown key: %q", key)
+				log.Infof("ConversationView got unknown key %q", key)
 			}
 		}
-		ov.screen.Draw()
+		draw()
 	}
-}
-
-func (ov *OpenMessageView) showRaw(ctx context.Context) error {
-	m, err := ov.msg.Raw(ctx)
-	if err != nil {
-		return errors.Wrapf(err, "Fetching raw msg")
-	}
-	return ov.showPager(ctx, m)
-}
-
-func (ov *OpenMessageView) showPager(ctx context.Context, content string) error {
-	ov.keys.Stop()
-	defer func() {
-		if err := ov.keys.Start(); err != nil {
-			log.Infof("Failed to restart input: %v", err)
-		}
-	}()
-
-	cmd := exec.CommandContext(ctx, pagerBinary)
-	cmd.Stdin = strings.NewReader(content)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Start(); err != nil {
-		return errors.Wrapf(err, "failed to start pager %q", pagerBinary)
-	}
-	if err := cmd.Wait(); err != nil {
-		return errors.Wrapf(err, "pager %q failed", pagerBinary)
-	}
-	log.Infof("Pager finished")
-	return nil
-}
-
-func (ov *OpenMessageView) scroll(ctx context.Context, lines, scroll, inc int) int {
-	if ov.msg.HasData(cmdg.LevelFull) {
-		scroll += inc
-		if maxscroll := (lines - ov.screen.Height + 10); scroll >= maxscroll {
-			scroll = maxscroll
-		}
-		if scroll < 0 {
-			scroll = 0
-		}
-	}
-	return scroll
 }

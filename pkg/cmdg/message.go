@@ -213,7 +213,21 @@ func NewMessage(c *CmdG, msgID string) *Message {
 func NewMessageWithResponse(c *CmdG, msgID string, resp *gmail.Message, level DataLevel) *Message {
 	m := NewMessage(c, msgID)
 	m.Response = resp
-	m.level = level
+	if resp.Payload != nil && len(resp.Payload.Headers) > 0 {
+		m.headers = make(map[string]string)
+		for _, h := range resp.Payload.Headers {
+			m.headers[strings.ToLower(h.Name)] = h.Value
+		}
+		// We can only claim metadata level here — full level requires
+		// body parsing that only msg.load() performs.
+		if level == LevelFull {
+			m.level = LevelMetadata
+		} else {
+			m.level = level
+		}
+	} else {
+		m.level = level
+	}
 	return m
 }
 

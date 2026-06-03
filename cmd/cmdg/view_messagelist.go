@@ -4,14 +4,10 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
-
-	"google.golang.org/api/gmail/v1"
-	"google.golang.org/api/googleapi"
 
 	"github.com/ThomasHabets/cmdg/pkg/cmdg"
 	"github.com/ThomasHabets/cmdg/pkg/dialog"
@@ -21,26 +17,86 @@ import (
 
 const (
 	scrollLimit = 5
+)
 
-	messageListViewHelp = `?, F1              — Help
-enter, →           — Open message
-space, x           — Mark message and advance
-X                  — Mark message and step up
-u                  — Unmark all messages
-e                  — Archive marked messages
-d                  — Move marked messages to trash
-I                  — Mark marked mails as read
-l                  — Label marked messages
-L                  — Unlabel marked messages
-*                  — Toggle starred on highlighted message
+var (
+	messageListReloadTimeout = 40 * time.Second
+)
+
+func help(txt string, keys *input.Input) error {
+	screen, err := display.NewScreen()
+	if err != nil {
+		return err
+	}
+	lines := strings.Split(txt, "\n")
+	maxlen := 0
+	for _, l := range lines {
+		if n := len(l); n > maxlen {
+			maxlen = n
+		}
+	}
+	screen.Printlnf(0, "%s", strings.Repeat("—", screen.Width))
+	for n, l := range lines {
+		screen.Printlnf(n+1, "%s%s", strings.Repeat(" ", (screen.Width-maxlen)/2), l)
+	}
+	for {
+		screen.Draw()
+		k := <-keys.Chan()
+		switch k {
+		case input.Enter:
+			return nil
+		}
+	}
+}
+
+func showError(oscreen *display.Screen, keys *input.Input, msg string) {
+	log.Warningf("Displaying error to user: %q", msg)
+
+	screen := oscreen.Copy()
+	lines := []string{
+		strings.Repeat("—", screen.Width),
+	}
+	for len(msg) > 0 {
+		this := msg
+		if len(this) > screen.Width {
+			this, msg = msg[:screen.Width], msg[screen.Width:]
+		} else {
+			msg = ""
+		}
+		lines = append(lines, this)
+	}
+	lines = append(lines, "Press [enter] to continue", lines[0])
+	start := (screen.Height - len(lines)) / 2
+	for n, l := range lines {
+		screen.Printlnf(start+n, "%s%s", display.Red, l)
+	}
+	screen.Draw()
+	for {
+		if input.Enter == <-keys.Chan() {
+			return
+		}
+	}
+}
+
+const (
+	threadListViewHelp = `?, F1              — Help
+enter, →           — Open conversation
+space, x           — Mark thread and advance
+X                  — Mark thread and step up
+e                  — Archive marked threads
+d                  — Move marked threads to trash
+I                  — Mark marked threads as read
+l                  — Label marked threads
+L                  — Unlabel marked threads
+*                  — Toggle starred on highlighted thread
 c                  — Compose new message
 C                  — Continue message from draft
-N, n, ^N, j, Down  — Next message
-P, p, ^P, k, Up    — Previous message
+N, n, ^N, j, Down  — Next thread
+P, p, ^P, k, Up    — Previous thread
 r, ^R              — Reload current view
 g                  — Go to label
 1                  — Go to inbox
-U                  — Mark marked mails as unread
+U                  — Mark marked threads as unread
 s, ^s              — Search
 q                  — Quit
 ^L                 — Refresh screen
@@ -49,141 +105,68 @@ Press [enter] to exit
 `
 )
 
-var (
-	//messageListReloadTime          = time.Minute
-	messageListReloadTimeout       = 40 * time.Second
-	messageListHistoryCheckTime    = 10 * time.Second
-	messageListHistoryCheckTimeout = 10 * time.Second
-)
-
-type historyUpdate struct {
-	historyID cmdg.HistoryID
-	history   []*gmail.History
-}
-
-type concurrency struct {
-	lock chan struct{}
-}
-
-func newConcurrency(i int) *concurrency {
-	return &concurrency{
-		lock: make(chan struct{}, 1),
-	}
-}
-func (c *concurrency) Take() bool {
-	select {
-	case c.lock <- struct{}{}:
-		return true
-	default:
-		return false
-	}
-}
-func (c *concurrency) Done() {
-	<-c.lock
-}
-
-// MessageView is the state for a message view.
-type MessageView struct {
+// ThreadListView is the state for a thread list view.
+type ThreadListView struct {
 	// Static state.
 	label string
 	query string
 
 	// Communicate with main thread.
-	keys            *input.Input
-	errors          chan error
-	pageCh          chan *cmdg.Page
-	messageCh       chan *cmdg.Message
-	historyUpdateCh chan historyUpdate
-	removeMessage   chan string
+	keys     *input.Input
+	errors   chan error
+	pageCh   chan *cmdg.ThreadPage
+	threadCh chan *cmdg.Thread
 
 	// Only for use by main thread.
-	messages  []*cmdg.Message
-	pos       int
-	historyID cmdg.HistoryID
+	threads []*cmdg.Thread
+	pos     int
 }
 
-// NewMessageView creates a new message view.
-func NewMessageView(ctx context.Context, label, q string, in *input.Input) *MessageView {
-	v := &MessageView{
-		label:           label,
-		errors:          make(chan error, 20),
-		pageCh:          make(chan *cmdg.Page),
-		historyUpdateCh: make(chan historyUpdate, 20),
-		messageCh:       make(chan *cmdg.Message),
-		keys:            in,
-		query:           q,
+// NewThreadListView creates a new thread list view.
+func NewThreadListView(ctx context.Context, label, q string, in *input.Input) *ThreadListView {
+	v := &ThreadListView{
+		label:    label,
+		errors:   make(chan error, 20),
+		pageCh:   make(chan *cmdg.ThreadPage),
+		threadCh: make(chan *cmdg.Thread),
+		keys:     in,
+		query:    q,
 	}
 	go v.fetchPage(ctx, "")
 	return v
 }
 
-// returns:
-// * true if doing anything. If this is 'false' then don't use other two returns.
-// * new list of messages
-// * an offset of how much pos should go back by after removal
-func (mv *MessageView) applyMarked(ctx context.Context, name string, op func(context.Context, []string) error, marked map[string]bool) (bool, []*cmdg.Message, int) {
-	ids, nm, ofs := filterMarked(mv.messages, marked, mv.pos)
-	if len(ids) == 0 {
-		log.Infof("No marked messages to do do operation %q on", name)
-		return false, nil, 0
-	}
-	go func() {
-		st := time.Now()
-		if err := op(ctx, ids); err != nil {
-			mv.errors <- errors.Wrapf(err, "batch operation %q failed", name)
-		}
-		log.Infof("Batch operation %q on %d messages: %v", name, len(ids), time.Since(st))
-	}()
-	log.Infof("Batch operation %q on %d messages (in background)", name, len(ids))
-	return true, nm, ofs
-}
+func (tv *ThreadListView) fetchPage(ctx context.Context, token string) {
+	listCtx, listCancel := context.WithTimeout(ctx, messageListReloadTimeout)
+	defer listCancel()
 
-func (mv *MessageView) fetchPage(ctx context.Context, token string) {
-	ctx, cancel := context.WithTimeout(ctx, messageListReloadTimeout)
-	if token == "" {
-		// Only update history on first page.
-		hid, err := conn.HistoryID(ctx)
-		if err != nil {
-			log.Errorf("Failed to get history ID: %v", err)
-		} else {
-			log.Infof("Initing history ID to %d", hid)
-			mv.historyUpdateCh <- historyUpdate{
-				historyID: hid,
-			}
-		}
-	}
-
-	log.Infof("Listing messages on label %q query %q with token %q…", mv.label, mv.query, token)
+	log.Infof("Listing threads on label %q query %q with token %q…", tv.label, tv.query, token)
 	st := time.Now()
-	page, err := conn.ListMessages(ctx, mv.label, mv.query, token)
+	page, err := conn.ListThreads(listCtx, tv.label, tv.query, token)
 	if err != nil {
-		mv.errors <- err
-		cancel()
+		tv.errors <- err
 		return
 	}
-	log.Infof("Listing messages took %v", time.Since(st))
+	log.Infof("Listing threads took %v", time.Since(st))
 	go func() {
-		defer cancel()
-		if err := page.PreloadSubjects(ctx); err != nil {
-			mv.errors <- err
-			return
+		if err := page.PreloadMetadata(ctx, tv.threadCh); err != nil {
+			tv.errors <- err
 		}
 	}()
-	mv.pageCh <- page
+	tv.pageCh <- page
 }
 
-// MessageViewOp is an operation to perform as the message closes.
-type MessageViewOp struct {
-	fun         func(*MessageView)
+// ThreadViewOp is an operation to perform as the conversation view closes.
+type ThreadViewOp struct {
+	fun         func(*ThreadListView)
 	quit        bool
-	nextMessage bool
-	prevMessage bool
-
-	next *MessageViewOp
+	nextThread  bool
+	prevThread  bool
+	next        *ThreadViewOp
 }
 
 // Do does the op.
-func (op *MessageViewOp) Do(view *MessageView) {
+func (op *ThreadViewOp) Do(view *ThreadListView) {
 	if op == nil {
 		return
 	}
@@ -196,176 +179,82 @@ func (op *MessageViewOp) Do(view *MessageView) {
 }
 
 // IsQuit returns if op is `quit`.
-func (op *MessageViewOp) IsQuit(view *MessageView) bool {
+func (op *ThreadViewOp) IsQuit() bool {
 	if op == nil {
 		return false
 	}
 	if op.quit {
 		return true
 	}
-	return op.next.IsQuit(view)
+	if op.next != nil {
+		return op.next.IsQuit()
+	}
+	return false
 }
 
 // IsNext returns if op is `next`.
-func (op *MessageViewOp) IsNext(view *MessageView) bool {
+func (op *ThreadViewOp) IsNext() bool {
 	if op == nil {
 		return false
 	}
-	if op.nextMessage {
+	if op.nextThread {
 		return true
 	}
-	return op.next.IsNext(view)
+	if op.next != nil {
+		return op.next.IsNext()
+	}
+	return false
 }
 
-// IsPrev returns if op is `prev`
-func (op *MessageViewOp) IsPrev(view *MessageView) bool {
+// IsPrev returns if op is `prev`.
+func (op *ThreadViewOp) IsPrev() bool {
 	if op == nil {
 		return false
 	}
-	if op.prevMessage {
+	if op.prevThread {
 		return true
 	}
-	return op.next.IsPrev(view)
+	if op.next != nil {
+		return op.next.IsPrev()
+	}
+	return false
 }
 
-// OpRemoveCurrent creates an op to remove current message from a list.
-func OpRemoveCurrent(next *MessageViewOp) *MessageViewOp {
-	return &MessageViewOp{
-		fun: func(view *MessageView) {
-			// TODO
-			view.messages = append(view.messages[:view.pos], view.messages[view.pos+1:]...)
-			if view.pos >= len(view.messages) && view.pos != 0 {
-				view.pos--
+// ThreadOpRemoveCurrent creates an op to remove current thread from the list.
+func ThreadOpRemoveCurrent(next *ThreadViewOp) *ThreadViewOp {
+	return &ThreadViewOp{
+		fun: func(view *ThreadListView) {
+			if view.pos < len(view.threads) {
+				view.threads = append(view.threads[:view.pos], view.threads[view.pos+1:]...)
+				if view.pos >= len(view.threads) && view.pos != 0 {
+					view.pos--
+				}
 			}
 		},
 		next: next,
 	}
 }
 
-// OpQuit creates an op to quit.
-func OpQuit() *MessageViewOp {
-	return &MessageViewOp{
-		quit: true,
-	}
+// ThreadOpQuit creates an op to quit.
+func ThreadOpQuit() *ThreadViewOp {
+	return &ThreadViewOp{quit: true}
 }
 
-// OpPrev creates an op to go to prev message.
-func OpPrev() *MessageViewOp {
-	return &MessageViewOp{
-		prevMessage: true,
-	}
+// ThreadOpPrev creates an op to go to the previous thread.
+func ThreadOpPrev() *ThreadViewOp {
+	return &ThreadViewOp{prevThread: true}
 }
 
-// OpNext creates an op to go to the next message.
-func OpNext() *MessageViewOp {
-	return &MessageViewOp{
-		nextMessage: true,
-	}
+// ThreadOpNext creates an op to go to the next thread.
+func ThreadOpNext() *ThreadViewOp {
+	return &ThreadViewOp{nextThread: true}
 }
 
-// filterMarked takes:
-// * slice of messages
-// * a set of marked message IDs
-// * current position
-// And returns the state if marked messages are removed
-// * ids of the messages removed
-// * slice of messages remaining after removal
-// * an offset of how much pos should go back by after removal
-//
-// The offset is returned as an offset because it's used both for
-// setting the new position and for adjusting current scroll position.
-func filterMarked(msgs []*cmdg.Message, marked map[string]bool, pos int) ([]string, []*cmdg.Message, int) {
-	var ids []string
-	ms := []*cmdg.Message{}
-	ofs := 0
-	for n, msg := range msgs {
-		if marked[msg.ID] {
-			ids = append(ids, msg.ID)
-			if n < pos {
-				ofs++
-			}
-		} else {
-			ms = append(ms, msg)
-		}
-	}
-	return ids, ms, ofs
-}
-
-func filterMessage(msgs []*cmdg.Message, id string, pos int) ([]*cmdg.Message, int) {
-	var ret []*cmdg.Message
-
-	for n, msg := range msgs {
-		if msg.ID == id {
-			if n < pos {
-				pos--
-			}
-			continue
-		}
-		ret = append(ret, msg)
-	}
-	return ret, pos
-}
-
-func (mv *MessageView) historyCheck(ctx context.Context) error {
-	hists, hid, err := conn.History(ctx, mv.historyID, mv.label)
-	if err != nil {
-		return errors.Wrapf(err, "getting history since %d", mv.historyID)
-	}
-	if len(hists) == 0 {
-		log.Infof("No history since last check")
-		return nil
-	}
-
-	// The GMail API returns false positives if a new message
-	// affects *any thread* that is in the current label, even if
-	// the message itself doesn't have the label.
-	// This was closed by Google as working as intended. :-(
-	//
-	// https://issuetracker.google.com/issues/137671760
-	//
-	// So we'll need to get the messages' list of labels before
-	// sending them on to the list view.
-	var wg sync.WaitGroup
-	for hi := range hists {
-		hi := hi
-		for mi := range hists[hi].MessagesAdded {
-			mi := mi
-			if len(hists[hi].MessagesAdded[mi].Message.LabelIds) > 0 {
-				continue
-			}
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				m := cmdg.NewMessage(conn, hists[hi].MessagesAdded[mi].Message.Id)
-				// Load labels.
-				ls, err := m.GetLabels(ctx, true)
-				if err != nil {
-					log.Errorf("Failed to load labels for history entry: %v", err)
-					return
-				}
-				for _, l := range ls {
-					hists[hi].MessagesAdded[mi].Message.LabelIds = append(hists[hi].MessagesAdded[mi].Message.LabelIds, l.ID)
-				}
-			}()
-		}
-	}
-	wg.Wait()
-
-	mv.historyUpdateCh <- historyUpdate{
-		historyID: hid,
-		history:   hists,
-	}
-	return nil
-}
-
-// Run runs the messagelist view.
-func (mv *MessageView) Run(ctx context.Context) error {
-	log.Infof("Running MessageView")
-	// TODO: defer a sync.WaitGroup.Wait() waiting on all goroutines spawned.
+// Run runs the thread list view.
+func (tv *ThreadListView) Run(ctx context.Context) error {
+	log.Infof("Running ThreadListView")
 	theresMore := true
 	var contentHeight int
-	var pages []*cmdg.Page
-	messagePos := map[string]int{}
 	marked := map[string]bool{}
 	var scroll int
 	var screen *display.Screen
@@ -377,7 +266,7 @@ func (mv *MessageView) Run(ctx context.Context) error {
 			return err
 		}
 		contentHeight = screen.Height - 2
-		scroll = 0 // TODO: only scroll back if we need to.
+		scroll = 0
 		return nil
 	}
 	if err := initScreen(); err != nil {
@@ -388,101 +277,88 @@ func (mv *MessageView) Run(ctx context.Context) error {
 		screen.Draw()
 	}()
 
-	mkMessagePos := func() {
-		messagePos = map[string]int{}
-		for n, m := range mv.messages {
-			messagePos[m.ID] = n
-		}
-	}
 	empty := func() {
 		screen.Printf(0, 0, "Loading…")
 		screen.Draw()
-		pages = nil
-		mv.messages = nil
-		mkMessagePos()
-		mv.pos = 0
+		tv.threads = nil
+		tv.pos = 0
 		scroll = 0
 	}
 	empty()
 
-	drawMessage := func(cur int) error {
+	drawThread := func(cur int) error {
 		s := "Loading…"
-		if cur >= len(mv.messages) {
-			return fmt.Errorf("trying to draw message %d with len %d", cur, len(mv.messages))
+		if cur >= len(tv.threads) {
+			return fmt.Errorf("trying to draw thread %d with len %d", cur, len(tv.threads))
 		}
-		curmsg := mv.messages[cur]
+		curThread := tv.threads[cur]
 
 		prefix := " "
 		reset := display.Reset
-		if cur == mv.pos {
+		if cur == tv.pos {
 			reset = display.Reverse
 			prefix = "*"
 		}
 
-		if curmsg.HasData(cmdg.LevelMetadata) {
-			subj, err := curmsg.GetSubject(ctx)
-			if errors.Cause(err) == cmdg.ErrMissing || subj == "" {
+		if curThread.HasData(cmdg.LevelMetadata) {
+			subj, err := curThread.Subject(ctx)
+			if err != nil || subj == "" {
 				subj = "(No subject)"
-			} else if err != nil {
-				return err
 			}
-			tm, err := curmsg.GetTimeFmt(ctx)
+			participants, err := curThread.Participants(ctx)
 			if err != nil {
-				log.Infof("Failed to parse mail date: %v", err)
-				tm = "???"
+				participants = []string{"?"}
 			}
-			from, err := curmsg.GetFrom(ctx)
-			if err != nil {
-				return err
+			from := strings.Join(participants, ", ")
+			count := curThread.MessageCount()
+			countStr := ""
+			if count > 1 {
+				countStr = fmt.Sprintf(" (%d)", count)
 			}
-			colors, fullColors, err := curmsg.GetLabelColors(ctx, mv.label)
-			if err != nil {
-				return err
+			from = display.FixedWidth(from, 24-len(countStr)) + countStr
+
+			// Get time from last message
+			tm := "???"
+			lastTime, err := curThread.LastMessageTime(ctx)
+			if err == nil && !lastTime.IsZero() {
+				now := time.Now()
+				if lastTime.Year() == now.Year() && lastTime.YearDay() == now.YearDay() {
+					tm = lastTime.Format("15:04")
+				} else if now.Sub(lastTime) < 7*24*time.Hour {
+					tm = lastTime.Format("Mon02")
+				} else {
+					tm = lastTime.Format("Jan02")
+				}
 			}
-			if len(colors) > 0 {
-				colors = " | " + colors
-				fullColors = " | " + fullColors
-			}
-			from = display.FixedWidth(from, 20)
+
 			s = fmt.Sprintf("%[1]*.[1]*[2]s | %[3]s | %[4]s",
 				6, tm,
 				from, subj)
-			if display.StringWidth(s)+display.StringWidth(fullColors) < screen.Width {
-				s += fullColors
-			} else {
-				s += colors
-			}
 			s += reset
 		} else {
-			go func(cur int) {
-				if err := curmsg.Preload(ctx, cmdg.LevelMetadata); err != nil {
-					log.Warningf("Failed to load metadata for email ID %s: %v", curmsg.ID, err)
-					if e, ok := errors.Cause(err).(*googleapi.Error); ok {
-						log.Warningf("Failing to load was googleapi error %+v", e)
-						if e.Code == 404 {
-							mv.removeMessage <- curmsg.ID
-						}
-					}
+			go func() {
+				if err := curThread.Preload(ctx, cmdg.LevelMetadata); err != nil {
+					log.Warningf("Failed to load metadata for thread %s: %v", curThread.ID, err)
 				} else {
-					mv.messageCh <- curmsg
+					tv.threadCh <- curThread
 				}
-			}(cur)
+			}()
 		}
 
-		if marked[curmsg.ID] {
+		if marked[curThread.ID] {
 			prefix += "X"
 		} else {
 			prefix += " "
 		}
 
-		if curmsg.IsUnread() {
+		if curThread.IsUnread() {
 			prefix = display.Bold + prefix + ">"
 		} else {
 			prefix += " "
 		}
 
 		star := " "
-		if curmsg.HasLabel(cmdg.Starred) {
+		if curThread.IsStarred() {
 			star = "*"
 			prefix = display.Yellow + prefix
 		}
@@ -491,449 +367,266 @@ func (mv *MessageView) Run(ctx context.Context) error {
 		return nil
 	}
 
-	timer := time.NewTicker(messageListHistoryCheckTime)
-	defer timer.Stop()
-	historyConcurrency := newConcurrency(1)
-
 	prev := func() bool {
-		if mv.pos <= 0 {
+		if tv.pos <= 0 {
 			return false
 		}
-		mv.pos--
-		if scroll > 0 && mv.pos < scroll+scrollLimit {
+		tv.pos--
+		if scroll > 0 && tv.pos < scroll+scrollLimit {
 			scroll--
 		}
 		return true
 	}
 	next := func() bool {
-		if mv.messages == nil {
+		if tv.threads == nil {
 			return false
 		}
-		if mv.pos >= len(mv.messages)-1 {
+		if tv.pos >= len(tv.threads)-1 {
 			return false
 		}
-		if mv.pos-scroll > contentHeight-scrollLimit {
+		if tv.pos-scroll > contentHeight-scrollLimit {
 			scroll++
 		}
-		mv.pos++
+		tv.pos++
 		return true
 	}
+
 	for {
 		status := ""
 		select {
-		case histUpdate := <-mv.historyUpdateCh:
-			log.Infof("Got history update: %+v", histUpdate)
-			if histUpdate.historyID < mv.historyID {
-				log.Warningf("Got out of order history entry %d < %d", histUpdate.historyID, mv.historyID)
-			} else if histUpdate.historyID == mv.historyID {
-				log.Infof("Got duplicate history update %d", mv.historyID)
-			} else {
-				mv.historyID = histUpdate.historyID
-				for _, hist := range histUpdate.history {
-					log.Infof("History entry: %d add, %d delete, %d labeladd, %d labeldelete", len(hist.MessagesAdded), len(hist.MessagesDeleted), len(hist.LabelsAdded), len(hist.LabelsRemoved))
-					for _, m := range hist.MessagesDeleted {
-						ind, found := messagePos[m.Message.Id]
-						if found {
-							log.Infof("Deleting message from in accordance with history")
-							mv.messages = append(mv.messages[:ind], mv.messages[ind+1:]...)
-							if ind < mv.pos {
-								mv.pos--
-							}
-						}
-					}
-
-					for _, ladd := range hist.LabelsAdded {
-						// Messages moved into this label (and other labels).
-						if msgn, found := messagePos[ladd.Message.Id]; found {
-							msg := mv.messages[msgn]
-							for _, l := range ladd.LabelIds {
-								log.Infof("Adding label %q", l)
-								msg.AddLabelIDLocal(l)
-							}
-						} else {
-							// New message for this view.
-							this := false
-							for _, l := range ladd.LabelIds {
-								if l == mv.label {
-									this = true
-									break
-								}
-							}
-							if this {
-								// Confirmed. This is a new message.
-								log.Infof("History says %q was moved to current label %q", ladd.Message.Id, mv.label)
-								nm := cmdg.NewMessage(conn, ladd.Message.Id)
-								// TODO: add it in the right place, not the top.
-								mv.messages = append([]*cmdg.Message{nm}, mv.messages...)
-								mkMessagePos()
-							}
-						}
-					}
-
-					for _, ma := range hist.MessagesAdded {
-						// New messages… also in this view.
-						if _, found := messagePos[ma.Message.Id]; !found {
-							// Double-check that the message has the current label.
-							// If there are no labels then err on the side of showing the message.
-							//
-							// That probably the right behaviour since it should only happen for
-							// no-label searches getting new results.
-							addme := true
-							hasData := false
-							if len(ma.Message.LabelIds) > 0 {
-								addme = false
-								hasData = true
-								for _, l := range ma.Message.LabelIds {
-									if l == mv.label {
-										addme = true
-										break
-									}
-								}
-							}
-							if addme {
-								log.Infof("Adding message from history")
-								var nm *cmdg.Message
-								if hasData {
-									nm = cmdg.NewMessageWithResponse(conn, ma.Message.Id, ma.Message, cmdg.LevelMinimal)
-								} else {
-									nm = cmdg.NewMessage(conn, ma.Message.Id)
-								}
-								// TODO: add it in the right place, not the top.
-								mv.messages = append([]*cmdg.Message{nm}, mv.messages...)
-								mkMessagePos()
-							} else {
-								log.Infof("Skipped adding message because history returned false positive")
-							}
-						}
-					}
-					for _, lrm := range hist.LabelsRemoved {
-						ind, found := messagePos[lrm.Message.Id]
-						if found {
-							msg := mv.messages[ind]
-							this := false
-							for _, l := range lrm.LabelIds {
-								for _, el := range msg.LocalLabels() {
-									if l == el {
-										msg.RemoveLabelIDLocal(l)
-									}
-								}
-								if l == mv.label {
-									this = true
-								}
-							}
-							if this {
-								log.Infof("… message %s gone from this view", lrm.Message.Id)
-								mv.messages = append(mv.messages[:ind], mv.messages[ind+1:]...)
-								if ind < mv.pos {
-									mv.pos--
-								}
-								mkMessagePos()
-							}
-						}
-					}
-				}
-			}
-
-		case <-timer.C: // Check history every now and then.
-			if mv.label != "" {
-				if historyConcurrency.Take() {
-					st := time.Now()
-					go func() {
-						defer historyConcurrency.Done()
-						defer func() {
-							log.Infof("History check took %v", time.Since(st))
-						}()
-						ctx, cancel := context.WithTimeout(ctx, messageListHistoryCheckTimeout)
-						defer cancel()
-						if err := mv.historyCheck(ctx); err != nil {
-							log.Errorf("Error getting history: %s", err)
-						}
-					}()
-				} else {
-					log.Infof("Not history checking because one is already running")
-				}
-			} else {
-				log.Infof("Not checking history because not in a label")
-			}
-			if false {
-				// TODO: don't reset pos and scroll
-				log.Infof("Timed reload")
-				empty()
-				screen.Clear()
-				go mv.fetchPage(ctx, "")
-			}
-
-		case <-mv.keys.Winch():
-			log.Infof("MessageListView got WINCH!")
-			if err := initScreen(); err != nil {
-				// Screen failed to init. Yeah it's time to bail.
-				return err
-			}
-		case err := <-mv.errors:
-			showError(screen, mv.keys, err.Error())
+		case err := <-tv.errors:
+			showError(screen, tv.keys, err.Error())
 			screen.Draw()
 			continue
-		case m := <-mv.messageCh:
-			cur := messagePos[m.ID]
-			if err := drawMessage(cur); err != nil {
-				mv.errors <- errors.Wrapf(err, "Drawing message")
+		case t := <-tv.threadCh:
+			// Thread metadata loaded, redraw its row.
+			for i, th := range tv.threads {
+				if th.ID == t.ID {
+					if err := drawThread(i); err != nil {
+						tv.errors <- errors.Wrapf(err, "Drawing thread")
+					}
+					break
+				}
 			}
-			screen.Draw() // TODO: avoid redrawing whole screen.
+			screen.Draw()
 			continue
-		case p := <-mv.pageCh:
-			log.Printf("MessageListView: Got page!")
-			pages = append(pages, p)
-			mv.messages = append(mv.messages, p.Messages...)
+		case p := <-tv.pageCh:
+			log.Printf("ThreadListView: Got page!")
+			tv.threads = append(tv.threads, p.Threads...)
 			want := contentHeight
 			if p.Response.NextPageToken == "" {
-				log.Infof("All pages loaded")
-				if len(mv.messages) == 0 {
+				log.Infof("All thread pages loaded")
+				if len(tv.threads) == 0 {
 					screen.Printlnf(0, "<empty>")
 				}
 				theresMore = false
 			} else {
-				if want > len(mv.messages) {
-					go mv.fetchPage(ctx, p.Response.NextPageToken)
+				if want > len(tv.threads) {
+					go tv.fetchPage(ctx, p.Response.NextPageToken)
 				} else {
-					log.Infof("Enough pages. Have %d messages, want %d", len(mv.messages), want)
+					log.Infof("Enough thread pages. Have %d threads, want %d", len(tv.threads), want)
 					theresMore = false
 				}
 			}
-			mkMessagePos()
 
-		case id := <-mv.removeMessage:
-			mv.messages, mv.pos = filterMessage(mv.messages, id, mv.pos)
-			mkMessagePos()
-
-		case key, ok := <-mv.keys.Chan():
+		case key, ok := <-tv.keys.Chan():
 			if !ok {
-				log.Errorf("MessageList: Input channel closed!")
+				log.Errorf("ThreadList: Input channel closed!")
 				continue
 			}
-			log.Debugf("MessageListView got key %q", key)
+			log.Debugf("ThreadListView got key %q", key)
 			switch key {
 			case "?", input.F1:
-				if err := help(messageListViewHelp, mv.keys); err != nil {
+				if err := help(threadListViewHelp, tv.keys); err != nil {
 					log.Infof("help() failed: %v", err)
 				}
 			case input.Enter, input.Right:
-				if len(mv.messages) == 0 {
-					// Let's assume we've never gotten to the state where mv.pos >= len(mv.messages)
-					break
-				}
-				if mv.pos >= len(mv.messages) {
+				if len(tv.threads) == 0 || tv.pos >= len(tv.threads) {
 					break
 				}
 				for {
-					vo, err := NewOpenMessageView(ctx, mv.messages[mv.pos], mv.keys)
+					cv := NewConversationView(ctx, tv.threads[tv.pos], tv.keys)
+					op, err := cv.Run(ctx)
 					if err != nil {
-						mv.errors <- errors.Wrapf(err, "Opening message")
-					} else {
-						op, err := vo.Run(ctx)
-						if err != nil {
-							mv.errors <- errors.Wrapf(err, "Running OpenMessageView")
-						}
-						op.Do(mv)
-						if op.IsQuit(mv) {
-							return nil
-						}
-						if op.IsPrev(mv) {
-							if mv.pos > 0 {
-								mv.pos--
-								if scroll > 0 {
-									scroll--
-								}
+						tv.errors <- errors.Wrapf(err, "Running ConversationView")
+						break
+					}
+					if op != nil {
+						op.Do(tv)
+					}
+					if op.IsQuit() {
+						return nil
+					}
+					if op.IsPrev() {
+						if tv.pos > 0 {
+							tv.pos--
+							if scroll > 0 {
+								scroll--
 							}
-							continue
 						}
-						if op.IsNext(mv) {
-							if mv.pos < len(mv.messages)-1 {
-								mv.pos++
-								if mv.pos-scroll > contentHeight-scrollLimit {
-									scroll++
-								}
+						continue
+					}
+					if op.IsNext() {
+						if tv.pos < len(tv.threads)-1 {
+							tv.pos++
+							if tv.pos-scroll > contentHeight-scrollLimit {
+								scroll++
 							}
-							continue
 						}
-						mkMessagePos() // op.Do() could have changed the message positions around.
+						continue
 					}
 					break
 				}
 			case input.CtrlL:
 				if err := initScreen(); err != nil {
-					// Screen failed to init. Yeah it's time to bail.
 					return err
 				}
 			case "e":
-				idch := make(chan []string)
-				ok, nm, ofs := mv.applyMarked(ctx, "archive", func(ctx context.Context, ids []string) error {
-					idch <- ids
-					return conn.BatchArchive(ctx, ids)
-				}, marked)
-				if !ok {
+				ids := tv.markedIDs(marked)
+				if len(ids) == 0 {
 					break
 				}
-				for _, id := range <-idch {
-					mv.messages[messagePos[id]].RemoveLabelIDLocal(cmdg.Inbox)
-				}
-				if mv.label == cmdg.Inbox {
-					mv.pos -= ofs
-					scroll -= ofs
-					if scroll < 0 {
-						scroll = 0
-					}
-					mv.messages = nm
-					marked = map[string]bool{}
-					mkMessagePos()
-				}
-			case "I": // Mark read.
-				idch := make(chan []string)
-				ok, _, _ := mv.applyMarked(ctx, "mark-read", func(ctx context.Context, ids []string) error {
-					idch <- ids
-					return conn.BatchUnlabel(ctx, ids, cmdg.Unread)
-				}, marked)
-				if !ok {
-					break
-				}
-				for _, id := range <-idch {
-					mv.messages[messagePos[id]].RemoveLabelIDLocal(cmdg.Unread)
-				}
-			case "U": // Mark unread.
-				idch := make(chan []string)
-				ok, _, _ := mv.applyMarked(ctx, "mark-unread", func(ctx context.Context, ids []string) error {
-					idch <- ids
-					return conn.BatchLabel(ctx, ids, cmdg.Unread)
-				}, marked)
-				if !ok {
-					break
-				}
-				for _, id := range <-idch {
-					mv.messages[messagePos[id]].AddLabelIDLocal(cmdg.Unread)
-				}
-			case "d":
-				ok, nm, ofs := mv.applyMarked(ctx, "delete", conn.BatchTrash, marked)
-				if !ok {
-					break
-				}
-				mv.pos -= ofs
-				scroll -= ofs
-				if scroll < 0 {
-					scroll = 0
-				}
-				mv.messages = nm
-				marked = map[string]bool{}
-				mkMessagePos()
-
-			case "*":
-				if mv.pos >= len(mv.messages) {
-					break
-				}
-				// TODO: Because it's a toggle this is not suitable for batch operation.
-				curmsg := mv.messages[mv.pos]
-				f := curmsg.AddLabelID
-				f2 := curmsg.AddLabelIDLocal
-
-				verb := "Adding"
-				if curmsg.HasLabel(cmdg.Starred) {
-					f = curmsg.RemoveLabelID
-					f2 = curmsg.RemoveLabelIDLocal
-					verb = "Removing"
-				}
-				f2(cmdg.Starred)
+				toRemove := tv.markedThreads(marked)
 				go func() {
-					if err := f(ctx, cmdg.Starred); err != nil {
-						mv.errors <- errors.Wrapf(err, "%s STARRED label", verb)
+					for _, t := range toRemove {
+						if err := t.RemoveLabelID(ctx, cmdg.Inbox); err != nil {
+							tv.errors <- errors.Wrapf(err, "archiving thread")
+						}
 					}
 				}()
-			case "l":
-				// TODO: can this be partially merged with 'L' code?
-				ids, _, _ := filterMarked(mv.messages, marked, mv.pos)
-				if len(ids) != 0 {
-					var opts []*dialog.Option
-					for _, l := range conn.Labels() {
-						opts = append(opts, &dialog.Option{
-							Key:   l.ID,
-							Label: l.Label,
-						})
-					}
-					label, err := dialog.Selection(opts, "Label> ", false, mv.keys)
-					if errors.Cause(err) == dialog.ErrAborted {
-						// No-op.
-					} else if err != nil {
-						mv.errors <- errors.Wrapf(err, "Selecting label")
-					} else {
-						for _, id := range ids {
-							mv.messages[messagePos[id]].AddLabelIDLocal(label.Key)
+				if tv.label == cmdg.Inbox {
+					tv.removeMarked(marked, &scroll)
+					marked = map[string]bool{}
+				}
+			case "I": // Mark read.
+				threads := tv.markedThreads(marked)
+				if len(threads) == 0 {
+					break
+				}
+				go func() {
+					for _, t := range threads {
+						if err := t.RemoveLabelID(ctx, cmdg.Unread); err != nil {
+							tv.errors <- errors.Wrapf(err, "marking thread read")
 						}
-						log.Infof("Batch labelling %q/%q %d messages in the background…", label.Key, label.Label, len(ids))
-						go func() {
-							st := time.Now()
-							if err := conn.BatchLabel(ctx, ids, label.Key); err != nil {
-								mv.errors <- errors.Wrapf(err, "Batch labelling")
-							} else {
-								log.Infof("Batch labelled %d: %v", len(ids), time.Since(st))
-							}
-						}()
+					}
+				}()
+			case "U": // Mark unread.
+				threads := tv.markedThreads(marked)
+				if len(threads) == 0 {
+					break
+				}
+				go func() {
+					for _, t := range threads {
+						if err := t.AddLabelID(ctx, cmdg.Unread); err != nil {
+							tv.errors <- errors.Wrapf(err, "marking thread unread")
+						}
+					}
+				}()
+			case "d":
+				threads := tv.markedThreads(marked)
+				if len(threads) == 0 {
+					break
+				}
+				go func() {
+					for _, t := range threads {
+						if err := t.Trash(ctx); err != nil {
+							tv.errors <- errors.Wrapf(err, "trashing thread")
+						}
+					}
+				}()
+				tv.removeMarked(marked, &scroll)
+				marked = map[string]bool{}
+			case "*":
+				if tv.pos >= len(tv.threads) {
+					break
+				}
+				curThread := tv.threads[tv.pos]
+				if curThread.IsStarred() {
+					go func() {
+						if err := curThread.RemoveLabelID(ctx, cmdg.Starred); err != nil {
+							tv.errors <- errors.Wrapf(err, "removing STARRED")
+						}
+					}()
+				} else {
+					go func() {
+						if err := curThread.AddLabelID(ctx, cmdg.Starred); err != nil {
+							tv.errors <- errors.Wrapf(err, "adding STARRED")
+						}
+					}()
+				}
+			case "l":
+				threads := tv.markedThreads(marked)
+				if len(threads) == 0 && tv.pos < len(tv.threads) {
+					threads = []*cmdg.Thread{tv.threads[tv.pos]}
+				}
+				if len(threads) == 0 {
+					break
+				}
+				var opts []*dialog.Option
+				for _, l := range conn.Labels() {
+					opts = append(opts, &dialog.Option{
+						Key:   l.ID,
+						Label: l.Label,
+					})
+				}
+				label, err := dialog.Selection(opts, "Label> ", false, tv.keys)
+				if errors.Cause(err) == dialog.ErrAborted {
+					// No-op.
+				} else if err != nil {
+					tv.errors <- errors.Wrapf(err, "Selecting label")
+				} else {
+					for _, t := range threads {
+						if err := t.AddLabelID(ctx, label.Key); err != nil {
+							tv.errors <- errors.Wrapf(err, "labelling thread")
+						}
 					}
 				}
 			case "L":
-				ids, _, _ := filterMarked(mv.messages, marked, mv.pos)
-				if len(ids) != 0 {
-					var opts []*dialog.Option
-				outer:
-					for _, l := range conn.Labels() {
-						for _, m := range ids {
-							if !mv.messages[messagePos[m]].HasLabel(l.ID) {
-								log.Warningf("Unknown label ID %q", l.ID)
-								continue outer
-							}
-						}
-						opts = append(opts, &dialog.Option{
-							Key:   l.ID,
-							Label: l.Label,
-						})
-					}
-					if len(opts) > 0 {
-						label, err := dialog.Selection(opts, "Label> ", false, mv.keys)
-						if errors.Cause(err) == dialog.ErrAborted {
-							// No-op.
-						} else if err != nil {
-							mv.errors <- errors.Wrapf(err, "Selecting label")
-						} else {
-							for _, id := range ids {
-								mv.messages[messagePos[id]].RemoveLabelIDLocal(label.Key)
-							}
-							log.Infof("Batch unlabelling %q/%q from %d messages in the background…", label.Key, label.Label, len(ids))
-							go func() {
-								st := time.Now()
-								if err := conn.BatchUnlabel(ctx, ids, label.Key); err != nil {
-									mv.errors <- errors.Wrapf(err, "Batch labelling")
-								} else {
-									log.Infof("Batch unlabelled %d: %v", len(ids), time.Since(st))
-								}
-							}()
+				threads := tv.markedThreads(marked)
+				if len(threads) == 0 && tv.pos < len(tv.threads) {
+					threads = []*cmdg.Thread{tv.threads[tv.pos]}
+				}
+				if len(threads) == 0 {
+					break
+				}
+				var opts []*dialog.Option
+				for _, l := range conn.Labels() {
+					opts = append(opts, &dialog.Option{
+						Key:   l.ID,
+						Label: l.Label,
+					})
+				}
+				label, err := dialog.Selection(opts, "Label> ", false, tv.keys)
+				if errors.Cause(err) == dialog.ErrAborted {
+					// No-op.
+				} else if err != nil {
+					tv.errors <- errors.Wrapf(err, "Selecting label")
+				} else {
+					for _, t := range threads {
+						if err := t.RemoveLabelID(ctx, label.Key); err != nil {
+							tv.errors <- errors.Wrapf(err, "unlabelling thread")
 						}
 					}
 				}
 			case "c":
-				if err := composeNew(ctx, conn, mv.keys); err != nil {
-					mv.errors <- errors.Wrapf(err, "Composing new message")
+				if err := composeNew(ctx, conn, tv.keys); err != nil {
+					tv.errors <- errors.Wrapf(err, "Composing new message")
 				}
 			case "C":
-				if err := continueDraft(ctx, conn, mv.keys); err != nil {
-					mv.errors <- errors.Wrapf(err, "Continuing draft")
+				if err := continueDraft(ctx, conn, tv.keys); err != nil {
+					tv.errors <- errors.Wrapf(err, "Continuing draft")
 				}
 			case input.Home, input.XHome:
-				mv.pos = 0
+				tv.pos = 0
 				scroll = 0
 			case "x", " ":
-				if mv.pos < len(mv.messages) {
-					marked[mv.messages[mv.pos].ID] = !marked[mv.messages[mv.pos].ID]
+				if tv.pos < len(tv.threads) {
+					marked[tv.threads[tv.pos].ID] = !marked[tv.threads[tv.pos].ID]
 					next()
 				}
 			case "X":
-				if mv.pos < len(mv.messages) {
-					marked[mv.messages[mv.pos].ID] = !marked[mv.messages[mv.pos].ID]
+				if tv.pos < len(tv.threads) {
+					marked[tv.threads[tv.pos].ID] = !marked[tv.threads[tv.pos].ID]
 					prev()
 				}
 			case "u":
@@ -941,19 +634,17 @@ func (mv *MessageView) Run(ctx context.Context) error {
 			case "N", "n", "j", input.CtrlN, input.Down:
 				screen.UseCache()
 				if !next() {
-					// If already on last one, don't redraw.
 					continue
 				}
 			case "P", "p", "k", input.CtrlP, input.Up:
 				screen.UseCache()
 				if !prev() {
-					// If already on first one, don't redraw.
 					continue
 				}
 			case "r", input.CtrlR:
 				empty()
 				screen.Clear()
-				go mv.fetchPage(ctx, "")
+				go tv.fetchPage(ctx, "")
 			case "g":
 				var opts []*dialog.Option
 				for _, l := range conn.Labels() {
@@ -968,61 +659,53 @@ func (mv *MessageView) Run(ctx context.Context) error {
 						Label: l.LabelString(),
 					})
 				}
-				label, err := dialog.Selection(opts, "Label> ", false, mv.keys)
+				label, err := dialog.Selection(opts, "Label> ", false, tv.keys)
 				if errors.Cause(err) == dialog.ErrAborted {
 					// No-op.
 				} else if err != nil {
-					mv.errors <- errors.Wrapf(err, "Selecting label")
+					tv.errors <- errors.Wrapf(err, "Selecting label")
 				} else {
-					nv := NewMessageView(ctx, label.Key, "", mv.keys)
-					// TODO: not optimal, since it adds a
-					// stack frame on every navigation.
+					nv := NewThreadListView(ctx, label.Key, "", tv.keys)
 					return nv.Run(ctx)
 				}
 			case "1":
-				// TODO: not optimal, since it adds a
-				// stack frame on every navigation.
-				return NewMessageView(ctx, cmdg.Inbox, "", mv.keys).Run(ctx)
+				return NewThreadListView(ctx, cmdg.Inbox, "", tv.keys).Run(ctx)
 			case "s", input.CtrlS:
-				q, err := dialog.Entry("Query> ", mv.keys)
+				q, err := dialog.Entry("Query> ", tv.keys)
 				if err == dialog.ErrAborted {
 					// That's fine.
 				} else if err != nil {
-					mv.errors <- errors.Wrapf(err, "Getting query")
+					tv.errors <- errors.Wrapf(err, "Getting query")
 				} else {
-					nv := NewMessageView(ctx, "", q, mv.keys)
-					// TODO: not optimal, since it adds a
-					// stack frame on every navigation.
+					nv := NewThreadListView(ctx, "", q, tv.keys)
 					return nv.Run(ctx)
 				}
 			case "q":
 				return nil
 			default:
-				log.Infof("MessageListView got unknown key %q %v", key, []byte(key))
+				log.Infof("ThreadListView got unknown key %q %v", key, []byte(key))
 			}
 		}
-		if mv.messages != nil {
+		if tv.threads != nil {
 			// Draw to buffer.
 			st := time.Now()
 			for n := 0; n < contentHeight; n++ {
 				cur := n + scroll
-				if cur >= len(mv.messages) {
+				if cur >= len(tv.threads) {
 					screen.Printlnf(n, "")
 					continue
 				}
-
-				if err := drawMessage(cur); err != nil {
-					mv.errors <- err
+				if err := drawThread(cur); err != nil {
+					tv.errors <- err
 				}
-
 				if time.Since(st) > 10*time.Millisecond {
 					screen.Draw()
 				}
 			}
-			if len(mv.messages) == 0 {
+			if len(tv.threads) == 0 {
 				screen.Printlnf(0, "<empty>")
 			}
-			log.Debugf("Print took %v", time.Since(st))
+			log.Debugf("Thread print took %v", time.Since(st))
 		}
 		// Print status.
 		if theresMore {
@@ -1035,5 +718,48 @@ func (mv *MessageView) Run(ctx context.Context) error {
 		st := time.Now()
 		screen.Draw()
 		log.Debugf("Draw took %v", time.Since(st))
+	}
+}
+
+func (tv *ThreadListView) markedIDs(marked map[string]bool) []string {
+	var ids []string
+	for id, m := range marked {
+		if m {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+func (tv *ThreadListView) markedThreads(marked map[string]bool) []*cmdg.Thread {
+	var threads []*cmdg.Thread
+	for _, t := range tv.threads {
+		if marked[t.ID] {
+			threads = append(threads, t)
+		}
+	}
+	return threads
+}
+
+func (tv *ThreadListView) removeMarked(marked map[string]bool, scroll *int) {
+	var remaining []*cmdg.Thread
+	ofs := 0
+	for i, t := range tv.threads {
+		if marked[t.ID] {
+			if i < tv.pos {
+				ofs++
+			}
+		} else {
+			remaining = append(remaining, t)
+		}
+	}
+	tv.threads = remaining
+	tv.pos -= ofs
+	*scroll -= ofs
+	if *scroll < 0 {
+		*scroll = 0
+	}
+	if tv.pos >= len(tv.threads) && tv.pos > 0 {
+		tv.pos = len(tv.threads) - 1
 	}
 }

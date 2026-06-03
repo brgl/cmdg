@@ -127,12 +127,12 @@ func run(ctx context.Context) error {
 		return err
 	}
 
-	v := NewMessageView(ctx, "INBOX", "", keys)
+	v := NewThreadListView(ctx, "INBOX", "", keys)
 
 	if err := v.Run(ctx); err != nil {
 		log.Errorf("Bailing due to error: %v", err)
 	}
-	log.Infof("MessageView returned, stopping keys")
+	log.Infof("ThreadListView returned, stopping keys")
 	keys.Stop()
 	log.Infof("Shutting down")
 	return nil

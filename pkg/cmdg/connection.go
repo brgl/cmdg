@@ -85,6 +85,7 @@ type CmdG struct {
 	drive        *drive.Service
 	people       *people.Service
 	messageCache map[string]*Message
+	threadCache  map[string]*Thread
 	labelCache   map[string]*Label
 	contacts     []string
 	settings     Settings
@@ -105,6 +106,17 @@ func (c *CmdG) MessageCache(msg *Message) *Message {
 	return msg
 }
 
+// ThreadCache returns the thread from the cache, or adds it.
+func (c *CmdG) ThreadCache(t *Thread) *Thread {
+	c.m.Lock()
+	defer c.m.Unlock()
+	if cached, found := c.threadCache[t.ID]; found {
+		return cached
+	}
+	c.threadCache[t.ID] = t
+	return t
+}
+
 // LabelCache returns the label fro the cache, or nil if not found.
 func (c *CmdG) LabelCache(label *Label) *Label {
 	c.m.Lock()
@@ -121,6 +133,7 @@ func NewFake(client *http.Client) (*CmdG, error) {
 	conn := &CmdG{
 		authedClient: client,
 		messageCache: make(map[string]*Message),
+		threadCache:  make(map[string]*Thread),
 		labelCache:   make(map[string]*Label),
 	}
 	return conn, conn.setupClients()
@@ -145,6 +158,7 @@ func readConf(fn string) (Config, error) {
 func New(fn string) (*CmdG, error) {
 	conn := &CmdG{
 		messageCache: make(map[string]*Message),
+		threadCache:  make(map[string]*Thread),
 		labelCache:   make(map[string]*Label),
 	}
 
@@ -754,4 +768,60 @@ func (c *CmdG) ListDrafts(ctx context.Context) ([]*Draft, error) {
 		return nil, err
 	}
 	return ret, nil
+}
+
+// ListThreads lists threads in a given label or query, with optional page token.
+func (c *CmdG) ListThreads(ctx context.Context, label, query, token string) (*ThreadPage, error) {
+	nres := int64(pageSize)
+
+	q := c.gmail.Users.Threads.List(email).
+		PageToken(token).
+		MaxResults(nres).
+		Context(ctx)
+	if query != "" {
+		q = q.Q(query)
+	}
+	if label != "" {
+		q = q.LabelIds(label)
+	}
+	var res *gmail.ListThreadsResponse
+	err := wrapLogRPC("gmail.Users.Threads.List", func() (err error) {
+		res, err = q.Do()
+		return
+	}, "email=%q token=%v labelID=%q query=%q size=%d", email, token, label, query, nres)
+	if err != nil {
+		return nil, errors.Wrap(err, "listing threads")
+	}
+	log.Infof("Thread list: next page token: %q, result size estimate: %d", res.NextPageToken, res.ResultSizeEstimate)
+	p := &ThreadPage{
+		conn:     c,
+		Label:    label,
+		Query:    query,
+		Response: res,
+	}
+	for _, t := range res.Threads {
+		p.Threads = append(p.Threads, NewThreadWithResponse(c, t.Id, t, LevelMinimal))
+	}
+	return p, nil
+}
+
+// ThreadModify modifies labels on an entire thread.
+func (c *CmdG) ThreadModify(ctx context.Context, threadID string, addLabels, removeLabels []string) error {
+	err := wrapLogRPC("gmail.Users.Threads.Modify", func() (err error) {
+		_, err = c.gmail.Users.Threads.Modify(email, threadID, &gmail.ModifyThreadRequest{
+			AddLabelIds:    addLabels,
+			RemoveLabelIds: removeLabels,
+		}).Context(ctx).Do()
+		return
+	}, "email=%q threadID=%v addLabels=%v removeLabels=%v", email, threadID, addLabels, removeLabels)
+	return err
+}
+
+// ThreadTrash trashes an entire thread.
+func (c *CmdG) ThreadTrash(ctx context.Context, threadID string) error {
+	err := wrapLogRPC("gmail.Users.Threads.Trash", func() (err error) {
+		_, err = c.gmail.Users.Threads.Trash(email, threadID).Context(ctx).Do()
+		return
+	}, "email=%q threadID=%v", email, threadID)
+	return err
 }
