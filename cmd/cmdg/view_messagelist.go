@@ -93,6 +93,8 @@ c                  — Compose new message
 C                  — Continue message from draft
 N, n, ^N, j, Down  — Next thread
 P, p, ^P, k, Up    — Previous thread
+PgDn               — Page down (3/4 screen)
+PgUp               — Page up (3/4 screen)
 r, ^R              — Reload current view
 g                  — Go to label
 1                  — Go to inbox
@@ -639,6 +641,34 @@ func (tv *ThreadListView) Run(ctx context.Context) error {
 			case "P", "p", "k", input.CtrlP, input.Up:
 				screen.UseCache()
 				if !prev() {
+					continue
+				}
+			case input.PgDown:
+				screen.UseCache()
+				jump := contentHeight * 3 / 4
+				moved := false
+				for i := 0; i < jump; i++ {
+					if next() {
+						moved = true
+					} else {
+						break
+					}
+				}
+				if !moved {
+					continue
+				}
+			case input.PgUp:
+				screen.UseCache()
+				jump := contentHeight * 3 / 4
+				moved := false
+				for i := 0; i < jump; i++ {
+					if prev() {
+						moved = true
+					} else {
+						break
+					}
+				}
+				if !moved {
 					continue
 				}
 			case "r", input.CtrlR:
