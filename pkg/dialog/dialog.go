@@ -223,6 +223,105 @@ func Entry(prompt string, keys *input.Input) (string, error) {
 	}
 }
 
+// EntryWithHistory asks the user for text input with search history suggestions.
+// On Down arrow or typing, matching history entries are shown and can be selected.
+func EntryWithHistory(prompt string, history []string, keys *input.Input) (string, error) {
+	screen, err := display.NewScreen()
+	if err != nil {
+		return "", err
+	}
+	cur := ""
+	last := ""
+	selected := -1
+	listVisible := false
+	prefix := "    "
+	keys.PastePush(false)
+	defer keys.PastePop()
+
+	// Build options from history (most recent first for display).
+	opts := make([]*Option, 0, len(history))
+	for i := len(history) - 1; i >= 0; i-- {
+		opts = append(opts, &Option{
+			Key:   history[i],
+			Label: history[i],
+		})
+	}
+
+	for {
+		start := 3
+		content := fmt.Sprintf("%s%s%s%s%s", prefix, display.Bold, prompt, display.Reset, cur)
+		screen.Printlnf(start+2, "%s", content)
+		screen.SetCursor(start+2, display.StringWidth(content)+1)
+
+		if listVisible {
+			visible := filterSubmatch(opts, cur)
+			if len(visible) == 0 && len(opts) == 0 {
+				screen.Printlnf(start+3, "%s  %s(no search history)%s", prefix, display.Grey, display.Reset)
+				for n := 1; n < len(opts)+1; n++ {
+					screen.Printlnf(start+3+n, "")
+				}
+			} else if len(visible) == 0 {
+				screen.Printlnf(start+3, "%s  %s(no matches)%s", prefix, display.Grey, display.Reset)
+				for n := 1; n < len(opts)+1; n++ {
+					screen.Printlnf(start+3+n, "")
+				}
+			} else {
+				for n, o := range visible {
+					sstr := display.Reset + " "
+					if selected == n {
+						sstr = display.Bold + ">"
+					}
+					screen.Printlnf(n+start+3, "%s%s %s", prefix, sstr, o)
+				}
+				for n := len(visible); n < len(opts); n++ {
+					screen.Printlnf(n+start+3, "")
+				}
+			}
+		}
+
+		screen.Draw()
+
+		key := <-keys.Chan()
+		visible := filterSubmatch(opts, cur)
+		switch key {
+		case input.Enter:
+			if selected >= 0 && selected < len(visible) {
+				return visible[selected].Key, nil
+			}
+			return cur, nil
+		case input.CtrlN, input.Down:
+			listVisible = true
+			if len(visible) > 0 {
+				selected++
+				if selected >= len(visible) {
+					selected = len(visible) - 1
+				}
+			}
+		case input.CtrlP, input.Up:
+			if selected > -1 {
+				selected--
+			}
+		case input.CtrlC:
+			return "", ErrAborted
+		case input.Backspace, input.CtrlH:
+			cur = TrimOneChar(cur)
+		case input.CtrlU:
+			cur = ""
+		default:
+			cur += string(key)
+			listVisible = true
+		}
+		if last != cur {
+			selected = -1
+			visible = filterSubmatch(opts, cur)
+			if len(visible) > 0 && listVisible {
+				selected = 0
+			}
+		}
+		last = cur
+	}
+}
+
 // Selection asks the user for a choice, with populated suggestions that can be searched in.
 // If `free` is `true` then the user can input anything. If `false` then the options listed are the only valid ones.
 // Example: Email recipient choice.
