@@ -22,6 +22,7 @@ var (
 const (
 	conversationViewHelp = `?, F1              — Help
 u, ←               — Back to thread list
+U                  — Back (mark unread)
 ^N                 — Next thread
 ^P                 — Previous thread
 enter              — Expand/collapse message
@@ -268,6 +269,13 @@ func (cv *ConversationView) Run(ctx context.Context) (*ThreadViewOp, error) {
 				if err := help(conversationViewHelp, cv.keys); err != nil {
 					log.Infof("help() failed: %v", err)
 				}
+			case "U":
+				go func() {
+					if err := cv.thread.AddLabelID(ctx, cmdg.Unread); err != nil {
+						log.Warningf("Failed to mark thread as unread: %v", err)
+					}
+				}()
+				return nil, nil
 			case "u", input.Left:
 				return nil, nil
 			case input.CtrlN:
