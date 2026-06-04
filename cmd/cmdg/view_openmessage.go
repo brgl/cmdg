@@ -39,6 +39,7 @@ r                  — Reply to last message
 a                  — Reply all to last message
 f                  — Forward last message
 t                  — View attachments of focused message
+S                  — Open shell with message env vars
 q                  — Quit
 
 Press [enter] to exit
@@ -394,6 +395,13 @@ func (cv *ConversationView) Run(ctx context.Context) (*ThreadViewOp, error) {
 				if cv.focusedMsg < len(msgs) {
 					if err := forward(ctx, conn, cv.keys, msgs[cv.focusedMsg]); err != nil {
 						cv.errors <- errors.Wrapf(err, "forwarding")
+					}
+				}
+			case "S":
+				msgs := cv.thread.Messages
+				if cv.focusedMsg < len(msgs) {
+					if err := openShell(ctx, cv.keys, msgs[cv.focusedMsg], cv.thread); err != nil {
+						cv.errors <- errors.Wrapf(err, "opening shell")
 					}
 				}
 			case "t":

@@ -61,6 +61,7 @@ const (
 	Reset         = "\033[0m"
 	NoWrap        = "\033[?7l"
 	DoWrap        = "\033[?7h"
+	ClearScreen   = "\033[2J\033[H" // Clear screen and home the cursor.
 	ResetScroll   = "\033[r"
 	SaveCursor    = "\033[s"         // TODO: actually this may not be supported
 	RestoreCursor = "\033[u"         // by some terminals. Find some other way?
