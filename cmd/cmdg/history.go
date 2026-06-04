@@ -43,3 +43,19 @@ func addToHistory(query string) {
 	data := strings.Join(filtered, "\n") + "\n"
 	_ = os.WriteFile(searchHistoryPath(), []byte(data), 0600)
 }
+
+func removeFromHistory(query string) {
+	history := loadSearchHistory()
+	var filtered []string
+	for _, h := range history {
+		if h != query {
+			filtered = append(filtered, h)
+		}
+	}
+	if len(filtered) == 0 {
+		_ = os.Remove(searchHistoryPath())
+		return
+	}
+	data := strings.Join(filtered, "\n") + "\n"
+	_ = os.WriteFile(searchHistoryPath(), []byte(data), 0600)
+}

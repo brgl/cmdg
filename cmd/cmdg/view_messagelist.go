@@ -701,7 +701,7 @@ func (tv *ThreadListView) Run(ctx context.Context) error {
 			case "1":
 				return NewThreadListView(ctx, cmdg.Inbox, "", tv.keys).Run(ctx)
 			case "s", input.CtrlS:
-				q, err := dialog.EntryWithHistory("Query> ", loadSearchHistory(), tv.keys)
+				q, err := dialog.EntryWithHistory("Query> ", loadSearchHistory(), tv.keys, removeFromHistory)
 				if err == dialog.ErrAborted {
 					// That's fine.
 				} else if err != nil {
