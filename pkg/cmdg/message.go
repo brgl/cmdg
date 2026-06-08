@@ -806,6 +806,7 @@ func makeBodyAlt(ctx context.Context, part *gmail.MessagePart, preferHTML bool) 
 			return "", err
 		}
 
+		dec = stripUnprintable(dec)
 		if p.MimeType == "text/html" {
 			dec, err = htmlRender(ctx, dec)
 			if err != nil {
